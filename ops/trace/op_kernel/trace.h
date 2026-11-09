@@ -101,11 +101,6 @@ __aicore__ inline void Trace<T>::Init(GM_ADDR self, GM_ADDR out, GM_ADDR workspa
         ubFactor_ = MAX_BLOCK_COUNT;
     }
 
-    if (GetBlockIdx() == 0) {
-        printf("[TILING] rows=%lld cols=%lld diag=%lld bf=%lld ub=%lld cores=%lld\n",
-               (long long)rows, (long long)cols_, (long long)tilingData->diagLen,
-               (long long)tilingData->blockFactor, (long long)tilingData->ubFactor, (long long)usedCoreNum_);
-    }
     inputGMX.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(self), rows * cols_);
     outputGMY.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(out), 1);
     // 每个核独占一个 32B 槽位，避免相邻核写同一 cache line 造成伪共享
