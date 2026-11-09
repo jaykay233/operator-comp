@@ -1,0 +1,31 @@
+# ---- CMake / 编译产物 ----
+build/
+build_out/
+ops/trace/build/
+ops/trace/build_out/
+ops/trace/tests/ut/build/
+ops/trace/examples/build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CPack*.cmake
+compile_commands.json
+install_manifest.txt
+
+# ---- 编译中间件 / 目标文件 ----
+*.o
+*.obj
+*.a
+*.so
+*.run
+*.log
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- 编辑器 / 系统 ----
+.DS_Store
+.idea/
+.vscode/
+*.swp
