@@ -24,6 +24,10 @@ install_manifest.txt
 __pycache__/
 *.pyc
 
+# ---- 大型文档（本地保留，不入库） ----
+# CANN 开发指南 PDF 约 45MB，需要时自行从 CANN 官网下载对应版本
+docs/*.pdf
+
 # ---- 编辑器 / 系统 ----
 .DS_Store
 .idea/
