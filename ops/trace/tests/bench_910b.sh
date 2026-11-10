@@ -193,5 +193,6 @@ PY
 step "汇总"
 echo "  逐组日志 : $OUT/c*/app.log"
 echo "  周期来源 : $OUT/c*/log_ca/profile_aiv_log0.toml"
+echo "  pipe 占比 / 停顿归因 : python3 $(dirname "${BASH_SOURCE[0]}")/parse_ca_dump.py $OUT"
 echo
 echo "${GREEN}${BOLD}基准测试完成${NC}"

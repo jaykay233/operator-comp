@@ -356,6 +356,67 @@ SHAPES="128x129 256x385" MODES="0 1" bash ops/trace/tests/bench_real.sh
 torch 的 pyc 一旦与解释器不匹配（`bad marshal data`），整个 UT 链路直接跑不起来。
 已改为纯 numpy（`np.trace`，同样 FP32 累加），UT 不再依赖 torch。
 
+### 7.4 试过但**不可行**：kernel 内分阶段打点
+
+想把 5.3~6.2 µs 精确拆到「搬入 / 计算 / 写回 / 框架」，在 kernel 里插
+`GetSystemCycle()` 时间戳写回 workspace。**结论：在这个环境里不可行**，
+两个原因都是实测出来的：
+
+**1) `GetSystemCycle()` 会把生产路径拖慢 ~1400 cycles，哪怕分支永不执行。**
+
+| 版本 | 1×1 | 256×385 |
+|---|---:|---:|
+| 无打点代码 | 4256 | 5158 |
+| `if (probe_) { …GetSystemCycle()… }`，probe_ 恒 false | 6216 | 7755 |
+
+只要这个调用出现在函数体里（运行时开关关着、分支从不进入）就会涨，
+因为它无法内联，迫使 `Init`/`Process` 建栈帧、局部变量溢出到栈。
+所以「运行时开关」这条路直接否掉了。
+
+**2) 改成编译期开关也走不通。** 试过 TPL 加 16/17 两个 tiling key：编译产物里
+只生成 2 个 kernel（`simplifiedKey` 里 d=0/1 各一组），16/17 没真正编进去；
+又试了 CMake 宏 —— Ascend C 的 kernel 走 ASC 前端自定义编译命令，不继承
+`target_compile_definitions`/`add_compile_definitions`，宏到不了 kernel 侧。
+
+**3) CAModel 下时间戳写回不通。** 用常量替代 `GetSystemCycle()`（排除非确定性）
+后读回仍然是全 0，说明 `SetValue` 到 UB + `DataCopy` 到 workspace 这条路径在
+CAModel 里没落盘。
+
+结论：真机归因不要自己做打点，**用 `msprof op --aic-metrics=PipeUtilization`**
+（`tests/bench_real.sh`），它是官方路径且不需要改 kernel。
+
+### 7.5 用 CAModel 的 instr dump 做归因（可行，且发现了新问题）
+
+`tests/parse_ca_dump.py` 解析 `profile_aiv_log0.toml` + `core*.instr_log.dump`，
+按「停顿类型」归因，比只看总 cycle 有用得多。256×385 float（blockDim=16）：
+
+| 项 | cycles | 占比 |
+|---|---:|---:|
+| 模型启动 → 首指令 | 560 | 10.9% |
+| RAW 标量依赖 | 1139 | 22.1% |
+| 等异步 flag | 404 | 7.8% |
+| 译码阻塞 | 1197 | 23.2% |
+| 无事件（等管道） | 1200 | 23.3% |
+| 末指令 → block 结束 | 555 | 10.8% |
+
+两个观察：
+
+1. **core0 比其它核慢 13.5%（5150 vs 4485）**，因为它串行做跨核归约
+   （读回 16 个槽位 + 二分归约 + 写回）。这是多核路径的结构性代价。
+2. 但这个代价换来的收益本身很小。同 build 内扫核数：
+
+| 核数 | 1 | 2 | 4 | 8 | 16 | 32 |
+|---|---:|---:|---:|---:|---:|---:|
+| cycles | 6289 | **6951** | 6104 | 5678 | 5639 | 5626 |
+
+8 核以上完全饱和（差 <1%），而 1 核也只要 6289 —— **多核总收益只有 ~10%**，
+因为 diagLen=256 的总工作量太小，核间同步 + core0 收尾吃掉了大部分。
+2 核最差（6951 > 1 核 6289），是跨核开销超过并行收益的典型区间。
+
+结论：在这个量级上，核数/归约的微调都已经贴着噪声走（跨 build 抖动 ±7~9%，
+见 §5.2），**继续在 CAModel 里抠 cycle 是无效功**，收益上限远小于真机那个
+2 µs 的可疑差距。下一步必须是真机 `mte2_ratio`。
+
 ---
 
 ## 8. 改动文件
@@ -370,3 +431,4 @@ torch 的 pyc 一旦与解释器不匹配（`bad marshal data`），整个 UT �
 | `tests/ut/op_kernel/trace_data/gen_data.py` | golden 去掉 torch 依赖，改纯 numpy |
 | `tests/bench_910b.sh` | 新增，取代 `measure_baseline.sh` / `sweep_opts.sh`；支持 `copy=` 切换搬运方式 |
 | `tests/bench_real.sh` | 新增，真机 `msprof op` 测耗时 + 管线归因，支持搬运方式 A/B |
+| `tests/parse_ca_dump.py` | 新增，解析 CAModel instr dump，按停顿类型（RAW 依赖/译码/等管道…）归因 |

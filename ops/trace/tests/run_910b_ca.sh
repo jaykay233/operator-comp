@@ -235,6 +235,7 @@ step "汇总"
 echo "  周期统计 : $OUT/run1/log_ca/profile_aiv_log0.toml"
 echo "  指令流水 : $OUT/run1/log_ca/core0.veccore0.instr_log.dump"
 echo "  完整日志 : $OUT/run1/app.log"
+echo "  pipe 占比 / 停顿归因 : python3 $(dirname "${BASH_SOURCE[0]}")/parse_ca_dump.py $OUT/run1/log_ca"
 [ -n "$KERNEL_OBJ" ] && echo "  kernel   : $KERNEL_OBJ"
 echo
 echo "${GREEN}${BOLD}910B1 周期仿真完成${NC}"
