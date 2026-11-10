@@ -44,9 +44,28 @@ warn() { echo "${YELLOW}[WARN]${NC} $*"; }
 
 CANN=${ASCEND_HOME_PATH:-/usr/local/Ascend/cann}
 export LD_LIBRARY_PATH="$CANN/lib64:$LD_LIBRARY_PATH"
-APP=${APP:-$TRACE_DIR/examples/build/bin/test_aclnn_trace}
-[ -x "$APP" ] || die "找不到可执行文件 $APP（先编译 examples，或设 APP=...）"
+
+# 可执行文件：优先用 APP，否则按常见产物路径依次探测
+if [ -z "$APP" ]; then
+    for c in "$TRACE_DIR/examples/build/bin/test_aclnn_trace" \
+             "$TRACE_DIR/examples/build/test_aclnn_trace" \
+             "$TRACE_DIR/examples/build/bin/aclnn_trace"; do
+        [ -x "$c" ] && APP="$c" && break
+    done
+fi
+[ -n "$APP" ] && [ -x "$APP" ] || die "找不到示例可执行文件（在 ops/trace/examples 下跑 bash run.sh 编译，或设 APP=/abs/path）"
 command -v msprof > /dev/null || die "找不到 msprof（需 CANN toolkit 且已 source set_env.sh）"
+PYBIN=$(command -v python3 || true)
+[ -n "$PYBIN" ] || die "找不到 python3（脚本用它解析 op_summary.csv；没有就手动看 csv）"
+
+# 算子包必须已安装，否则 aclnn 调用会直接失败
+if [ -z "$ASCEND_OPP_PATH" ]; then
+    warn "ASCEND_OPP_PATH 为空，确认算子包已 install（bash build.sh && ./custom_opp_*.run）"
+fi
+
+echo "  可执行文件 : $APP"
+echo "  msprof     : $(command -v msprof)"
+echo "  采集指标   : $METRICS"
 
 mkdir -p "$OUT"
 
@@ -98,15 +117,31 @@ from pathlib import Path
 out = Path(sys.argv[1])
 KEY = ("Duration", "ratio", "time(us)", "Name", "Type", "Block Dim")
 
+def find_summary(d):
+    """msprof op 的产物名各版本不完全一致，按内容找而不是按文件名猜。"""
+    cands = []
+    for pat in ("op_summary*.csv", "*summary*.csv", "*.csv"):
+        cands = sorted(d.rglob(pat))
+        for c in cands:
+            try:
+                head = c.open(encoding="utf-8", errors="replace").readline()
+            except OSError:
+                continue
+            if "Duration" in head or "Op Name" in head:
+                return c
+        if cands:
+            break
+    return None
+
 rows = []
 for d in sorted(out.iterdir()):
     if not d.is_dir():
         continue
-    csvs = sorted(d.rglob("op_summary*.csv"))
-    if not csvs:
+    csvp = find_summary(d)
+    if csvp is None:
         rows.append((d.name, None, {}))
         continue
-    with open(csvs[0], newline="", encoding="utf-8", errors="replace") as f:
+    with open(csvp, newline="", encoding="utf-8", errors="replace") as f:
         recs = list(csv.DictReader(f))
     if not recs:
         rows.append((d.name, None, {}))
@@ -125,8 +160,12 @@ for d in sorted(out.iterdir()):
     rows.append((d.name, dur(best), keep))
 
 if not rows:
-    print("    未找到 op_summary*.csv，检查 msprof.log 与 --output 路径")
+    print("    未找到任何采集结果，检查 $OUT/*/msprof.log")
     sys.exit(0)
+
+missing = [n for n, dur, _ in rows if dur is None]
+if missing:
+    print(f"    {len(missing)} 组没有采集到数据：{', '.join(missing)}")
 
 # 汇总：耗时 + 各 pipe 占比
 cols = None
