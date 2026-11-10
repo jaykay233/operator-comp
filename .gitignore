@@ -28,6 +28,17 @@ __pycache__/
 # CANN 开发指南 PDF 约 45MB，需要时自行从 CANN 官网下载对应版本
 docs/*.pdf
 
+# ---- 仿真/基准产物（可随时重跑生成） ----
+ca910b*/
+sim910b/
+simout/
+ca_out/
+simb*/
+simd/
+ops/trace/log_ca/
+build*.log
+!ops/trace/tests/**/*.log
+
 # ---- 编辑器 / 系统 ----
 .DS_Store
 .idea/

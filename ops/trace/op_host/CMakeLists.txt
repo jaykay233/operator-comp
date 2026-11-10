@@ -1,3 +1,6 @@
+# 解析 CANN host 架构目录（x86_64-linux / aarch64-linux），统一用 ${ASCEND_HOST_ARCH_DIR}
+include(${CMAKE_CURRENT_SOURCE_DIR}/../cmake/ascend_host_arch.cmake)
+
 file(GLOB host_ops_def_srcs
     ${CMAKE_CURRENT_SOURCE_DIR}/*def.cpp
 )
@@ -21,13 +24,13 @@ npu_op_code_gen(
     PACKAGE ${package_name}
     OUT_DIR ${ASCEND_AUTOGEN_PATH}
     COMPILE_OPTIONS
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/include
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/tiling
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/op_common
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/base
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/exe_graph
-        -I$ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/graph
+        -I${ASCEND_HOST_ARCH_DIR}/include
+        -I${ASCEND_HOST_ARCH_DIR}/asc/include/tiling
+        -I${ASCEND_HOST_ARCH_DIR}/pkg_inc
+        -I${ASCEND_HOST_ARCH_DIR}/pkg_inc/op_common
+        -I${ASCEND_HOST_ARCH_DIR}/pkg_inc/base
+        -I${ASCEND_HOST_ARCH_DIR}/pkg_inc/exe_graph
+        -I${ASCEND_HOST_ARCH_DIR}/pkg_inc/graph
 )
 
 npu_op_library(cust_optiling TILING
@@ -35,11 +38,11 @@ npu_op_library(cust_optiling TILING
 )
 
 target_include_directories(cust_optiling PRIVATE
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/tiling
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/op_common
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/base
+    ${ASCEND_HOST_ARCH_DIR}/include
+    ${ASCEND_HOST_ARCH_DIR}/asc/include/tiling
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/op_common
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/base
 )
 
 set(op_api_dir ${CMAKE_CURRENT_SOURCE_DIR}/../op_api)
@@ -55,13 +58,13 @@ npu_op_library(cust_opapi ACLNN
 
 target_include_directories(cust_opapi PRIVATE
     ${op_api_dir}
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include/aclnn
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/op_common
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/base
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/aicpu
+    ${ASCEND_HOST_ARCH_DIR}/include
+    ${ASCEND_HOST_ARCH_DIR}/include/aclnn
+    ${ASCEND_HOST_ARCH_DIR}/asc/include
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/op_common
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/base
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/aicpu
 )
 
 target_compile_options(cust_opapi PRIVATE -UACLNN_WITH_BINARY)
@@ -75,11 +78,11 @@ npu_op_library(cust_op_proto GRAPH
 )
 
 target_include_directories(cust_op_proto PRIVATE
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/tiling
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/op_common
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/base
+    ${ASCEND_HOST_ARCH_DIR}/include
+    ${ASCEND_HOST_ARCH_DIR}/asc/include/tiling
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/op_common
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/base
 )
 
 npu_op_package_add(${package_name}

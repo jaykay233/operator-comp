@@ -1,0 +1,11 @@
+# 构建上下文裁剪：cann-pkgs/ 里的大 run 包是必需输入，不能忽略
+.git
+.gitignore
+**/build
+**/build_out
+**/__pycache__
+**/*.o
+**/*.so
+**/*.a
+*.log
+docs/*.pdf

@@ -11,6 +11,10 @@ endif()
 
 message(STATUS "ASCEND_HOME_PATH: $ENV{ASCEND_HOME_PATH}")
 
+# 解析 CANN host 架构目录（x86_64-linux / aarch64-linux），统一用 ${ASCEND_HOST_ARCH_DIR}
+set(CANN_HOME "$ENV{ASCEND_HOME_PATH}")
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/ascend_host_arch.cmake)
+
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/BuildGoogleTest.cmake)
 
 # DTYPE 宏定义（根据算子原型和测试用例生成）
@@ -30,21 +34,21 @@ set(UT_COMMON_SRCS
 set(UT_COMMON_INCLUDE_DIRS
     ${UT_COMMON_DIR}
     $ENV{ASCEND_HOME_PATH}/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include/base
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/include/base/context_builder
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/asc/include/tiling
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/op_common
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/base
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/exe_graph
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/pkg_inc/graph
+    ${ASCEND_HOST_ARCH_DIR}/include
+    ${ASCEND_HOST_ARCH_DIR}/include/base
+    ${ASCEND_HOST_ARCH_DIR}/include/base/context_builder
+    ${ASCEND_HOST_ARCH_DIR}/asc/include
+    ${ASCEND_HOST_ARCH_DIR}/asc/include/tiling
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/op_common
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/base
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/exe_graph
+    ${ASCEND_HOST_ARCH_DIR}/pkg_inc/graph
 )
 
 set(UT_COMMON_LIB_DIRS
     $ENV{ASCEND_HOME_PATH}/lib64
-    $ENV{ASCEND_HOME_PATH}/aarch64-linux/lib64
+    ${ASCEND_HOST_ARCH_DIR}/lib64
 )
 
 add_compile_options(

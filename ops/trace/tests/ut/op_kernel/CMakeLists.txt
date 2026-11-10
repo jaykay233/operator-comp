@@ -13,9 +13,12 @@ endif()
 
 message(STATUS "Using CANN_HOME: ${CANN_HOME}")
 
+# 解析 CANN host 架构目录（x86_64-linux / aarch64-linux），统一用 ${ASCEND_HOST_ARCH_DIR}
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../../cmake/ascend_host_arch.cmake)
+
 set(SOC_VERSION "Ascend910B1")
 
-set(tikicpulib_DIR ${CANN_HOME}/tools/tikicpulib/lib/cmake)
+set(tikicpulib_DIR ${TIKICPULIB_CMAKE_DIR})
 find_package(tikicpulib REQUIRED)
 
 set(OP_KERNEL_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../op_kernel)
@@ -29,7 +32,7 @@ set(UT_INCLUDE_DIRS
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OP_KERNEL_DIR}
     ${UT_COMMON_INCLUDE_DIRS}
-    ${CANN_HOME}/tools/tikicpulib/lib/include
+    ${CANN_HOME}/toolkit/tools/tikicpulib/lib/include
     ${CANN_HOME}/compiler/ascendc/include/highlevel_api
     ${CANN_HOME}/compiler/ascendc/include/basic_api/impl
     ${CANN_HOME}/compiler/ascendc/include/basic_api
@@ -37,18 +40,18 @@ set(UT_INCLUDE_DIRS
     ${CANN_HOME}/compiler/ascendc/include/ascendc/host_api/tiling
     ${CANN_HOME}/compiler/ascendc/include/ascendc/host_api
     ${CANN_HOME}/compiler/ascendc/include/ascendc
-    ${CANN_HOME}/aarch64-linux/include
-    ${CANN_HOME}/aarch64-linux/asc/include/basic_api
-    ${CANN_HOME}/aarch64-linux/asc/include
-    ${CANN_HOME}/aarch64-linux/asc/include/interface
-    ${CANN_HOME}/aarch64-linux/asc/impl/basic_api
-    ${CANN_HOME}/aarch64-linux/asc
+    ${ASCEND_HOST_ARCH_DIR}/include
+    ${ASCEND_HOST_ARCH_DIR}/asc/include/basic_api
+    ${ASCEND_HOST_ARCH_DIR}/asc/include
+    ${ASCEND_HOST_ARCH_DIR}/asc/include/interface
+    ${ASCEND_HOST_ARCH_DIR}/asc/impl/basic_api
+    ${ASCEND_HOST_ARCH_DIR}/asc
     ${CANN_HOME}/compiler/tikcpp/tikcfw
     ${CANN_HOME}/compiler/tikcpp/tikcfw/impl
     ${CANN_HOME}/compiler/tikcpp/tikcfw/interface
-    ${CANN_HOME}/aarch64-linux/include/graph
-    ${CANN_HOME}/aarch64-linux/ascendc/include/highlevel_api
-    ${CANN_HOME}/aarch64-linux/asc/impl/basic_api/utils
+    ${ASCEND_HOST_ARCH_DIR}/include/graph
+    ${ASCEND_HOST_ARCH_DIR}/ascendc/include/highlevel_api
+    ${ASCEND_HOST_ARCH_DIR}/asc/impl/basic_api/utils
 )
 
 add_executable(${UT_EXE}
@@ -90,7 +93,7 @@ target_link_libraries(${UT_EXE} PRIVATE
 )
 
 set_target_properties(${UT_EXE} PROPERTIES
-    INSTALL_RPATH "$ORIGIN;${CANN_HOME}/lib64;${CANN_HOME}/tools/tikicpulib/lib;${CANN_HOME}/tools/tikicpulib/lib/Ascend910B1;${CANN_HOME}/aarch64-linux/simulator/Ascend910B1/lib"
+    INSTALL_RPATH "$ORIGIN;${CANN_HOME}/lib64;${CANN_HOME}/toolkit/tools/tikicpulib/lib;${CANN_HOME}/toolkit/tools/tikicpulib/lib/${SOC_VERSION};${ASCEND_HOST_ARCH_DIR}/simulator/${SOC_VERSION}/lib"
     BUILD_WITH_INSTALL_RPATH TRUE
 )
 
