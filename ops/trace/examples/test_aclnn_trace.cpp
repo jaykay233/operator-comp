@@ -1,6 +1,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <vector>
 #include <cstring>
 #include <cstdint>
@@ -56,6 +57,41 @@ static uint16_t FloatToBFloat16(float f) {
     uint32_t bits;
     memcpy(&bits, &f, sizeof(float));
     return (uint16_t)(bits >> 16);
+}
+
+// half / bf16 -> float，用于回读校验
+static float HalfToFloat(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (h >> 10) & 0x1Fu;
+    uint32_t mant = h & 0x3FFu;
+    uint32_t f;
+    if (exp == 0) {
+        if (mant == 0) {
+            f = sign;
+        } else {
+            while ((mant & 0x400u) == 0) {
+                mant <<= 1;
+                exp--;
+            }
+            exp++;
+            mant &= 0x3FFu;
+            f = sign | ((exp + 112) << 23) | (mant << 13);
+        }
+    } else if (exp == 31) {
+        f = sign | 0x7F800000u | (mant << 13);
+    } else {
+        f = sign | ((exp + 112) << 23) | (mant << 13);
+    }
+    float r;
+    memcpy(&r, &f, sizeof(float));
+    return r;
+}
+
+static float BFloat16ToFloat(uint16_t b) {
+    uint32_t f = (uint32_t)b << 16;
+    float r;
+    memcpy(&r, &f, sizeof(float));
+    return r;
 }
 
 template <typename T>
@@ -148,7 +184,17 @@ int main(int argc, char** argv)
     for (int64_t i = 0; i < elemCount; ++i) {
         selfHostData[i] = static_cast<float>((i * 37 % 101) - 50) * 0.25f;
     }
-    ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, aclDataType::ACL_FLOAT, &self);
+    // 输入 dtype 可通过环境变量 TRACE_DTYPE 指定（float / half / bf16），默认 float
+    aclDataType selfDtype = aclDataType::ACL_FLOAT;
+    if (const char* envDtype = std::getenv("TRACE_DTYPE")) {
+        const std::string dt(envDtype);
+        if (dt == "half" || dt == "fp16") {
+            selfDtype = aclDataType::ACL_FLOAT16;
+        } else if (dt == "bf16") {
+            selfDtype = aclDataType::ACL_BF16;
+        }
+    }
+    ret = CreateAclTensor(selfHostData, selfShape, &selfDeviceAddr, selfDtype, &self);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
 
     // 构造输出 tensor
@@ -156,7 +202,8 @@ int main(int argc, char** argv)
     void* outDeviceAddr = nullptr;
     std::vector<int64_t> outShape = {1};
     std::vector<float> outHostData(1, 0);
-    ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, aclDataType::ACL_FLOAT, &out);
+    // 输出 dtype 与输入一致（算子定义只支持 half/float 两种组合）
+    ret = CreateAclTensor(outHostData, outShape, &outDeviceAddr, selfDtype, &out);
     CHECK_RET(ret == ACL_SUCCESS, return ret);
     
 
@@ -181,10 +228,22 @@ int main(int argc, char** argv)
     ret = aclrtSynchronizeStream(stream);
     CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("aclrtSynchronizeStream failed. ERROR: %d\n", ret); return ret);
 
-    // 回读结果并与 CPU 参考实现对比
+    // 回读结果并与 CPU 参考实现对比（按输出 dtype 解释，输出与输入同 dtype）
     float outHost = 0.0f;
-    ret = aclrtMemcpy(&outHost, sizeof(float), outDeviceAddr, sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST);
-    CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy out failed. ERROR: %d\n", ret); return ret);
+    if (selfDtype == aclDataType::ACL_FLOAT16) {
+        uint16_t h = 0;
+        ret = aclrtMemcpy(&h, sizeof(h), outDeviceAddr, sizeof(h), ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy out failed. ERROR: %d\n", ret); return ret);
+        outHost = HalfToFloat(h);
+    } else if (selfDtype == aclDataType::ACL_BF16) {
+        uint16_t b = 0;
+        ret = aclrtMemcpy(&b, sizeof(b), outDeviceAddr, sizeof(b), ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy out failed. ERROR: %d\n", ret); return ret);
+        outHost = BFloat16ToFloat(b);
+    } else {
+        ret = aclrtMemcpy(&outHost, sizeof(float), outDeviceAddr, sizeof(float), ACL_MEMCPY_DEVICE_TO_HOST);
+        CHECK_RET(ret == ACL_SUCCESS, LOG_PRINT("copy out failed. ERROR: %d\n", ret); return ret);
+    }
 
     const int64_t diagLen = std::min(selfShape[0], selfShape[1]);
     double golden = 0.0;

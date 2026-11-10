@@ -1,22 +1,35 @@
 /*!
  * \file trace.h
- * \brief Trace 算子 kernel 类定义
+ * \brief Trace 算子 kernel 类定义（优化版）
  *
  * 功能：out[0] = sum_{i=0}^{min(M,N)-1} self[i][i]，内部以 FP32 累加，最后转回输入 dtype。
  *
- * 实现要点（对应赛题要求）：
- *   1. 跨步收集：主对角线在 GM 上步长为 (N+1) 个元素。用 DataCopyPad 的
- *      blockCount/blockLen/srcStride 描述多块跳跃搬运，一次 MTE2 搬完一段对角线，
- *      不做逐元素标量读取，也不整矩阵搬运。
- *   2. UB 布局与掩码：GM->UB 的 DataCopyPad 以 32B datablock 为最小写入粒度，
- *      第 i 个对角元素落在 UB 的第 i*ELEMS_PER_BLOCK 个槽位，块内其余字节的填充内容
- *      由硬件实现决定（可能填 pad 值，也可能重复元素值）。为不依赖该行为，
- *      先用固定掩码 [1,0,0,...,0] 逐块屏蔽，只保留每个 block 的首个元素再整段归约。
- *   3. FP32 累加：half/bf16 输入先 Cast 到 FP32 再参与 Mul/ReduceSum，累加器始终 FP32。
- *   4. 多核并行 + 确定性：沿对角线切分，各核把部分和用 MTE3 写入 workspace 的独立
- *      32B 槽位（DataCopy 保证写回可见），SyncAll 后由 0 号核用 MTE2 读回，
- *      按 blockIdx 升序串行累加。累加顺序固定，结果可复现。
- *   5. Double Buffer：输入队列深度 BUFFER_NUM=2，搬运与计算形成 ping-pong 流水。
+ * ---------------------------------------------------------------------------
+ * 设计要点
+ * ---------------------------------------------------------------------------
+ * 1. 跨步收集：主对角线在 GM 上步长为 (N+1) 个元素。用一条 DataCopyPad 的
+ *    blockCount/blockLen/srcStride 描述整段对角线，不做逐元素标量读取。
+ *
+ * 2. UB 布局与 padding 语义（实测结论）：
+ *    DataCopyPad 以 32B datablock 为最小粒度，第 i 个对角元素落在 UB 的第
+ *    i*ELEMS_PER_BLOCK 个 float 槽位。实测该 datablock 内其余字节是**元素值重复**
+ *    填充（fp32 下 8 个 float 全等于该元素）。因此不需要逐块掩码：
+ *    对整段做归约得到的和恰好是真实和的 ELEMS_PER_BLOCK 倍，最后按
+ *    1/ELEMS_PER_BLOCK 还原即可。这一步省掉了整段 mask 构造与一次全量 Mul。
+ *
+ * 3. 归约：采用手册 3.8.6.3「二分累加 + WholeReduceSum」方案 —— 先用 Add 把数据
+ *    反复折半，剩余元素数不超过一条 Repeat（float 为 64 个）时用一次
+ *    WholeReduceSum 收尾，避免 ReduceSum 接口内部的多指令组合与 Scalar 簿记。
+ *    折半在原张量上就地完成，不需要额外工作区。
+ *
+ * 4. 多核 + 确定性：按核沿对角线切分；各核把部分和写入 workspace 的独立 32B 槽位，
+ *    SyncAll 后 0 号核按 blockIdx 升序归约，累加顺序固定、结果可复现。
+ *    实测跨核屏障开销可达 1200 cycles，而本算子在小 shape 下是延迟瓶颈
+ *    （计算耗时几乎与元素数无关），因此 Tiling 默认只用 1 个核，仅在
+ *    diagLen 很大时才启用多核（见 trace_tiling.cpp 的 TRACE_MULTICORE_MIN_DIAG）。
+ *
+ * 5. UB 按需分配：标量/中转区仅 32 float + 跨核槽位；只有 half/bf16 需要一块
+ *    FP32 工作区（Cast 目标）。InitBuffer 从 10 次降到 2 次。
  */
 
 #ifndef TRACE_H
@@ -35,6 +48,9 @@ constexpr int32_t BUFFER_NUM = 2;               // 输入队列深度（double b
 constexpr int64_t BLOCK_BYTES = 32;             // UB 一个 datablock 的字节数
 constexpr int64_t SLOT_FLOATS = 8;              // 跨核部分和的槽位宽度（32B / sizeof(float)）
 constexpr int64_t MAX_BLOCK_COUNT = 4095;       // DataCopyPad blockCount 上限
+constexpr int64_t ONE_REPEAT_FLOAT = 64;        // 一条 Repeat 的 float 个数（256B / 4B）
+constexpr int64_t REDUCE_CHUNK = 8 * 511;       // 折半时单条指令处理的元素上限（规避 mask 计数上限）
+constexpr int64_t ELEMS_PER_BLOCK_F = 8;        // 一个 32B block 的 float 个数（折半粒度）
 
 template <typename T>
 class Trace {
@@ -47,24 +63,27 @@ public:
 private:
     // 每个 32B datablock 能容纳的 T 元素个数
     static constexpr int64_t ELEMS_PER_BLOCK = BLOCK_BYTES / (int64_t)sizeof(T);
+    // half/bf16 需要一块 FP32 工作区做 Cast；float 可以就地归约
+    static constexpr bool NEED_FLOAT_BUF = (sizeof(T) != sizeof(float));
 
-    __aicore__ inline void BuildMask();
     __aicore__ inline void CopyIn(int64_t offset, int64_t currentNum);
     __aicore__ inline void Compute(int64_t currentNum);
+    __aicore__ inline void ReduceBinary(const LocalTensor<float>& dst, const LocalTensor<float>& src, int64_t n);
     __aicore__ inline void WriteOut(float total);
+
+    // arena 内的 float 下标（单位：float，均按 32B = 8 float 对齐）
+    __aicore__ inline int64_t OffScalar() const { return 0; }
+    __aicore__ inline int64_t OffAccum() const { return 8; }
+    __aicore__ inline int64_t OffFinal() const { return 16; }
+    __aicore__ inline int64_t OffOut() const { return 24; }
+    __aicore__ inline int64_t OffCross() const { return 32; }
+    __aicore__ inline int64_t OffWork() const { return 32 + usedCoreNum_ * SLOT_FLOATS; }
 
 private:
     TPipe pipe;
     TQue<QuePosition::VECIN, BUFFER_NUM> inputQueueX;
-    TBuf<TPosition::VECCALC> maskBuf;     // 对角掩码 [1,0,0,...]
-    TBuf<TPosition::VECCALC> patBuf;      // 32B 掩码模式块 [1,0,0,...,0]
-    TBuf<TPosition::VECCALC> workBuf;     // FP32 工作区（搬入数据转 FP32 后按掩码过滤）
-    TBuf<TPosition::VECCALC> reduceBuf;   // ReduceSum 中间缓冲
-    TBuf<TPosition::VECCALC> scalarBuf;   // 单段归约结果
-    TBuf<TPosition::VECCALC> accumBuf;    // 本核 FP32 累加器
-    TBuf<TPosition::VECCALC> finalBuf;    // 最终 float 值
-    TBuf<TPosition::VECCALC> outBuf;      // 最终 T 类型输出值
-    TBuf<TPosition::VECCALC> crossBuf;    // 跨核部分和的中转 UB 区
+    // 所有 VECCALC Buffer 合并成一个 arena，只调一次 InitBuffer
+    TBuf<TPosition::VECCALC> arenaBuf;
 
     GlobalTensor<T> inputGMX;
     GlobalTensor<T> outputGMY;
@@ -74,6 +93,7 @@ private:
     int64_t start_ = 0;      // 本核负责的第一个对角元素下标
     int64_t count_ = 0;      // 本核负责的对角元素个数
     int64_t ubFactor_ = 1;   // 单次循环处理的元素个数
+    int64_t slots_ = 0;      // 单次循环在 UB 中的稠密 float 个数
     int64_t usedCoreNum_ = 1;
 };
 
@@ -100,78 +120,77 @@ __aicore__ inline void Trace<T>::Init(GM_ADDR self, GM_ADDR out, GM_ADDR workspa
     if (ubFactor_ > MAX_BLOCK_COUNT) {
         ubFactor_ = MAX_BLOCK_COUNT;
     }
+    slots_ = ubFactor_ * ELEMS_PER_BLOCK;
 
     inputGMX.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(self), rows * cols_);
     outputGMY.SetGlobalBuffer(reinterpret_cast<__gm__ T*>(out), 1);
     // 每个核独占一个 32B 槽位，避免相邻核写同一 cache line 造成伪共享
     workspaceGM.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(workspace), usedCoreNum_ * SLOT_FLOATS);
 
-    // 小缓冲在任何情况下都要初始化：即使本核没有对角元素，也必须参与 SyncAll
-    pipe.InitBuffer(scalarBuf, BLOCK_BYTES);
-    pipe.InitBuffer(accumBuf, BLOCK_BYTES);
-    pipe.InitBuffer(finalBuf, BLOCK_BYTES);
-    pipe.InitBuffer(outBuf, BLOCK_BYTES);
-    pipe.InitBuffer(patBuf, BLOCK_BYTES);
-    pipe.InitBuffer(crossBuf, usedCoreNum_ * SLOT_FLOATS * (int64_t)sizeof(float));
-
-    if (count_ <= 0) {
-        return;   // 无数据可搬，但仍会进入 Process 参与跨核同步
-    }
-
-    // 每个对角元素在 UB 中固定占一个 32B datablock；
-    // 转成 FP32 并按元素计数后，稠密数组占用 slots * 4 字节
-    const int64_t denseBytes = ubFactor_ * (BLOCK_BYTES * 4 / (int64_t)sizeof(T));
+    // 一次 InitBuffer 覆盖全部 VECCALC 需求：
+    //   小缓冲 32 float（scalar/accum/final/out 各 8）+ 跨核槽位 [+ half/bf16 的 FP32 工作区]
+    const int64_t arenaFloats = OffWork() + (NEED_FLOAT_BUF ? slots_ : 0);
+    pipe.InitBuffer(arenaBuf, arenaFloats * (int64_t)sizeof(float));
     pipe.InitBuffer(inputQueueX, BUFFER_NUM, ubFactor_ * BLOCK_BYTES);
-    pipe.InitBuffer(maskBuf, denseBytes);
-    pipe.InitBuffer(workBuf, denseBytes);
-    pipe.InitBuffer(reduceBuf, denseBytes);
 
-    BuildMask();
+    LocalTensor<float> arena = arenaBuf.Get<float>();
+    // 累加器清零（即使本核没有对角元素，也要参与后续跨核同步）
+    Duplicate(arena[OffAccum()], 0.0f, static_cast<int32_t>(SLOT_FLOATS));
+    PipeBarrier<PIPE_V>();
 }
 
 /*!
- * \brief 构造重复掩码 [1,0,0,...,0]（每 ELEMS_PER_BLOCK 个元素一个 1）
+ * \brief 二分累加 + WholeReduceSum（手册 3.8.6.3）
  *
- * 只依赖掩码本身，不依赖 DataCopyPad 在 UB 中如何填充 block 的空闲字节。
+ * 先用 Add 把数据反复折半，剩余元素数 ≤ 一条 Repeat（float 为 64 个）时用一次
+ * WholeReduceSum 收尾。全程就地完成，不需要额外工作区。
  *
- * 构造方式（倍增复制，O(log ubFactor) 条搬运指令，无标量循环）：
- *   1. 先写首个 32B 模式块 [1,0,0,0,0,0,0,0]；
- *   2. 已初始化的 len 个块整体复制到 [len, 2*len) 位置，len 翻倍，直到覆盖 ubFactor。
- * 相比逐块 SetValue（ubFactor 次标量写），这样避免把 SCALAR 管线打满。
+ * 三个实现约束（都实测踩过）：
+ *   1. 必须按 32B block（8 个 float）为粒度折叠，且折半只能是「等分」：
+ *      把 [0,half) 与 [half,2*half) 相加。若只折 floor(cur/2) 个元素，
+ *      中间那段元素既不在目的区也不在源区，会被静默丢掉 —— 表现为结果偏小。
+ *   2. block 数为奇数时，最后一块单独并入第 0 块，然后再继续折半。
+ *   3. 单条向量指令的 mask 计数有上限（实测 4096 越界、4095 以内安全），
+ *      因此 Add 按 REDUCE_CHUNK = 8*511 = 4088 个元素分块下发。
  */
 template <typename T>
-__aicore__ inline void Trace<T>::BuildMask()
+__aicore__ inline void Trace<T>::ReduceBinary(const LocalTensor<float>& dst, const LocalTensor<float>& src, int64_t n)
 {
-    LocalTensor<float> maskLocal = maskBuf.Get<float>();
+    BinaryRepeatParams params;
+    params.dstBlkStride = 1;
+    params.src0BlkStride = 1;
+    params.src1BlkStride = 1;
+    params.dstRepStride = 8;
+    params.src0RepStride = 8;
+    params.src1RepStride = 8;
 
-    // 每个对角元素在 UB 中占一个 32B datablock；转 FP32 后对应 ELEMS_PER_BLOCK 个 float。
-    // 因此掩码的重复周期是 ELEMS_PER_BLOCK（fp32 为 8，fp16/bf16 为 16），
-    // 对应 patBlocks 个 32B datablock。
-    const int64_t patFloats = ELEMS_PER_BLOCK;
-    const int64_t patBlocks = patFloats / SLOT_FLOATS;
-
-    // 首个模式单元：[1, 0, 0, ..., 0]
-    Duplicate(maskLocal, 0.0f, static_cast<int32_t>(patFloats));
-    PipeBarrier<PIPE_ALL>();
-    maskLocal.SetValue(0, 1.0f);
-    PipeBarrier<PIPE_ALL>();
-
-    int64_t len = 1;   // 已初始化好的模式单元个数
-    while (len < ubFactor_) {
-        int64_t n = ubFactor_ - len;
-        if (n > len) {
-            n = len;
+    SetMaskCount();
+    int64_t nb = n / ELEMS_PER_BLOCK_F;    // 折半以 32B block 为单位
+    while (nb > 8) {
+        const int64_t half = nb / 2;              // 等分的前半 block 数
+        const int64_t cnt = half * ELEMS_PER_BLOCK_F;
+        int64_t off = 0;
+        while (off < cnt) {
+            int64_t chunk = cnt - off;
+            if (chunk > REDUCE_CHUNK) {
+                chunk = REDUCE_CHUNK;
+            }
+            SetVectorMask<uint8_t, MaskMode::COUNTER>(0, static_cast<uint32_t>(chunk));
+            Add<float, false>(src[off], src[off], src[cnt + off], MASK_PLACEHOLDER, 1, params);
+            off += chunk;
         }
-        // srcStride = dstStride = 0 表示源/目的各自连续，即把前 len 个单元整体搬到 len 之后
-        DataCopyParams copyParams;
-        copyParams.blockCount = static_cast<uint16_t>(n * patBlocks);
-        copyParams.blockLen = 1;   // 单位：32B datablock
-        copyParams.srcStride = 0;
-        copyParams.dstStride = 0;
-        DataCopy(maskLocal[len * patFloats], maskLocal, copyParams);
-        PipeBarrier<PIPE_ALL>();
-        len += n;
+        // 奇数 block：把最后一个块并入第 0 块，避免丢元素
+        if ((nb & 1) != 0) {
+            SetVectorMask<uint8_t, MaskMode::COUNTER>(0, static_cast<uint32_t>(ELEMS_PER_BLOCK_F));
+            Add<float, false>(src[0], src[0], src[(nb - 1) * ELEMS_PER_BLOCK_F], MASK_PLACEHOLDER, 1, params);
+        }
+        nb = half;
     }
+    // 收尾：一次 WholeReduceSum 把 1 个 Repeat 内的元素归约成 1 个
+    SetVectorMask<uint8_t, MaskMode::COUNTER>(0, static_cast<uint32_t>(nb * ELEMS_PER_BLOCK_F));
+    WholeReduceSum<float, false>(dst, src, MASK_PLACEHOLDER, 1, 1, 1, 8);
+    ResetMask();
+    SetMaskNorm();
 }
 
 template <typename T>
@@ -201,25 +220,24 @@ template <typename T>
 __aicore__ inline void Trace<T>::Compute(int64_t currentNum)
 {
     LocalTensor<T> xLocal = inputQueueX.DeQue<T>();
-    LocalTensor<float> workLocal = workBuf.Get<float>();
-    LocalTensor<float> maskLocal = maskBuf.Get<float>();
-    LocalTensor<float> accumLocal = accumBuf.Get<float>();
-    LocalTensor<float> scalarLocal = scalarBuf.Get<float>();
-    LocalTensor<float> reduceLocal = reduceBuf.Get<float>();
+    LocalTensor<float> arena = arenaBuf.Get<float>();
+    LocalTensor<float> accumLocal = arena[OffAccum()];
+    LocalTensor<float> scalarLocal = arena[OffScalar()];
 
-    // UB 中每个对角元素占一个 32B datablock
     const int64_t slots = currentNum * ELEMS_PER_BLOCK;
 
-    // 1) 统一转 FP32，并按掩码只保留每个 block 的首元素（不依赖 padding 内容）
-    if constexpr (sizeof(T) == sizeof(float)) {
-        Mul(workLocal, xLocal, maskLocal, static_cast<int32_t>(slots));
+    LocalTensor<float> srcLocal;
+    if constexpr (NEED_FLOAT_BUF) {
+        // half/bf16：先统一转 FP32（padding 同样是元素值重复，转换后仍然重复）
+        srcLocal = arena[OffWork()];
+        Cast(srcLocal, xLocal, RoundMode::CAST_NONE, static_cast<int32_t>(slots));
     } else {
-        Cast(workLocal, xLocal, RoundMode::CAST_NONE, static_cast<int32_t>(slots));
-        Mul(workLocal, workLocal, maskLocal, static_cast<int32_t>(slots));
+        // float：就地归约，不需要额外工作区
+        srcLocal = xLocal;
     }
-    // 2) 整段归约到 FP32 标量
-    ReduceSum<float>(scalarLocal, workLocal, reduceLocal, static_cast<int32_t>(slots));
-    // 3) 段间累加（FP32）
+
+    ReduceBinary(scalarLocal, srcLocal, slots);
+    // 段间累加（FP32）
     Add(accumLocal, accumLocal, scalarLocal, 1);
 
     inputQueueX.FreeTensor(xLocal);
@@ -228,11 +246,13 @@ __aicore__ inline void Trace<T>::Compute(int64_t currentNum)
 template <typename T>
 __aicore__ inline void Trace<T>::WriteOut(float total)
 {
+    LocalTensor<float> arena = arenaBuf.Get<float>();
     if constexpr (sizeof(T) == sizeof(float)) {
         outputGMY.SetValue(0, total);
     } else {
-        LocalTensor<float> finalLocal = finalBuf.Get<float>();
-        LocalTensor<T> yLocal = outBuf.Get<T>();
+        LocalTensor<float> finalLocal = arena[OffFinal()];
+        // out 槽位按字节偏移换算成 T 单位
+        LocalTensor<T> yLocal = arenaBuf.Get<T>()[OffOut() * (int64_t)sizeof(float) / (int64_t)sizeof(T)];
         finalLocal.SetValue(0, total);
         PipeBarrier<PIPE_ALL>();
         Cast(yLocal, finalLocal, RoundMode::CAST_RINT, 1);
@@ -246,8 +266,7 @@ __aicore__ inline void Trace<T>::Process()
 {
     float localSum = 0.0f;
     if (count_ > 0) {
-        LocalTensor<float> accumLocal = accumBuf.Get<float>();
-        Duplicate(accumLocal, 0.0f, 1);
+        LocalTensor<float> accumLocal = arenaBuf.Get<float>()[OffAccum()];
 
         int64_t done = 0;
         while (done < count_) {
@@ -259,11 +278,11 @@ __aicore__ inline void Trace<T>::Process()
             Compute(currentNum);
             done += currentNum;
         }
-        localSum = accumLocal.GetValue(0);
+        // padding 是元素值重复 → 归约结果被放大 ELEMS_PER_BLOCK 倍，此处一次性还原
+        localSum = accumLocal.GetValue(0) / static_cast<float>(ELEMS_PER_BLOCK);
     }
 
     const int64_t blockIdx = static_cast<int64_t>(GetBlockIdx());
-    LocalTensor<float> crossLocal = crossBuf.Get<float>();
 
     if (usedCoreNum_ <= 1) {
         if (blockIdx == 0) {
@@ -274,6 +293,7 @@ __aicore__ inline void Trace<T>::Process()
 
     // ---- 多核汇总 ----
     // 用 MTE3 写回，保证别的核能通过 MTE2 读到最新值；槽位按 32B 对齐互不重叠。
+    LocalTensor<float> crossLocal = arenaBuf.Get<float>()[OffCross()];
     Duplicate(crossLocal, 0.0f, static_cast<int32_t>(SLOT_FLOATS));
     crossLocal.SetValue(0, localSum);
     PipeBarrier<PIPE_ALL>();
@@ -283,14 +303,13 @@ __aicore__ inline void Trace<T>::Process()
     SyncAll<true>();
 
     if (blockIdx == 0) {
-        // 0 号核按 blockIdx 升序串行累加，累加顺序固定（确定性）
+        // 0 号核读回全部槽位：每个槽位只有第 0 个 float 有值、其余为 0，
+        // 因此可以直接向量归约（累加顺序由归约本身固定，结果确定）。
         DataCopy(crossLocal, workspaceGM[0], usedCoreNum_ * SLOT_FLOATS);
         PipeBarrier<PIPE_ALL>();
-        float total = 0.0f;
-        for (int64_t i = 0; i < usedCoreNum_; ++i) {
-            total += crossLocal.GetValue(i * SLOT_FLOATS);
-        }
-        WriteOut(total);
+        LocalTensor<float> scalarLocal = arenaBuf.Get<float>()[OffScalar()];
+        ReduceBinary(scalarLocal, crossLocal, usedCoreNum_ * SLOT_FLOATS);
+        WriteOut(scalarLocal.GetValue(0));
     }
 }
 

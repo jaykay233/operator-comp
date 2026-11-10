@@ -1,6 +1,10 @@
 /*!
  * \file trace_tiling_data.h
  * \brief Trace 算子 TilingData 结构
+ *
+ * 注意（手册 3.8.3.2「限制 TilingData 结构大小」）：TilingData 会从 GM 拷贝到
+ * AI Core 栈空间，期间是 us 级开销，小 shape 下占比明显。因此只保留必要字段。
+ * NumBlocks 不在此传递 —— 它已通过 SetBlockDim 下发，Kernel 侧可直接 GetBlockNum。
  */
 
 #ifndef _TRACE_TILING_DATA_H_

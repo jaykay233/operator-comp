@@ -35,8 +35,12 @@ struct TraceTestParam {
 static TraceTestParam testCases[] = {
     // 1x1：最小边界，单核单元素
     {"trace_0", {1, 1}, ge::DT_FLOAT, ge::FORMAT_ND, {1}, ge::DT_FLOAT, ge::FORMAT_ND, "Ascend910B", ge::GRAPH_SUCCESS, 1UL, "1 1 1 1 1 1 ", {32}, 64, 262144, 4096},
-    // 256x385：非对齐矩形，diagLen=256，切 4 核，每核 64 个对角元素
-    {"trace_1", {256, 385}, ge::DT_FLOAT, ge::FORMAT_ND, {1}, ge::DT_FLOAT, ge::FORMAT_ND, "Ascend910B", ge::GRAPH_SUCCESS, 1UL, "256 385 256 64 64 4 ", {128}, 64, 262144, 4096},
+    // 128x129：diagLen=128 < MULTICORE_MIN_DIAG(192)，单核整段处理
+    {"trace_1", {128, 129}, ge::DT_FLOAT, ge::FORMAT_ND, {1}, ge::DT_FLOAT, ge::FORMAT_ND, "Ascend910B", ge::GRAPH_SUCCESS, 1UL, "128 129 128 128 128 1 ", {32}, 64, 262144, 4096},
+    // 256x385：diagLen=256 ≥ 192，按每核 16 个元素切 16 核
+    {"trace_2", {256, 385}, ge::DT_FLOAT, ge::FORMAT_ND, {1}, ge::DT_FLOAT, ge::FORMAT_ND, "Ascend910B", ge::GRAPH_SUCCESS, 1UL, "256 385 256 16 16 16 ", {512}, 64, 262144, 4096},
+    // 512x513：diagLen=512，每核 16 个元素 -> 32 核，未超过 maxAIVNum(64)
+    {"trace_3", {512, 513}, ge::DT_FLOAT, ge::FORMAT_ND, {1}, ge::DT_FLOAT, ge::FORMAT_ND, "Ascend910B", ge::GRAPH_SUCCESS, 1UL, "512 513 512 16 16 32 ", {1024}, 64, 262144, 4096},
 };
 
 class TraceTilingTest : public testing::TestWithParam<TraceTestParam> {
