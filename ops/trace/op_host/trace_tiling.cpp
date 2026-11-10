@@ -52,6 +52,8 @@ constexpr int64_t MIN_DIAG_ELEMS_PER_CORE = 16;
 constexpr int64_t MAX_BLOCK_COUNT = 4095;
 // 跨核部分和槽位宽度（32B，与 kernel 侧 SLOT_FLOATS 一致）
 constexpr int64_t SLOT_BYTES = 32;
+// 跨核槽位最大个数（与 kernel 侧 MAX_SLOTS 一致）：workspace 按此预留
+constexpr int64_t MAX_SLOTS = 64;
 // 启用多核的最小对角线长度（低于此值单核更快，实测见文件头）
 constexpr int64_t MULTICORE_MIN_DIAG = 192;
 
@@ -180,14 +182,24 @@ static ge::graphStatus TraceTilingFunc(gert::TilingContext* context)
     tiling->blockFactor = blockFactor;
     tiling->ubFactor = ubFactor;
     tiling->usedCoreNum = blockDim;
+    // 搬运方式探针：TRACE_COPY=1 强制走 4B+padding，用于真机 A/B 对比
+    tiling->copyMode = static_cast<uint8_t>(ReadEnvInt("TRACE_COPY", 0) == 1 ? 1 : 0);
     context->GetRawTilingData()->SetDataSize(sizeof(TraceTilingData));
 
     // ---- workspace：每核一个 32B 槽位存部分和（DataCopy 要求 32B 对齐） ----
+    // 按 MAX_SLOTS 预留而不是按 blockDim：手册 6.2.3.7.2.3 的 SyncAll 约束下，
+    // 实际上核数必须不大于逻辑 numBlocks，预留到上限可避免任何调度差异导致越界写。
     size_t* currentWorkspace = context->GetWorkspaceSizes(1);
     OP_CHECK_NULL_WITH_CONTEXT(context, currentWorkspace);
-    currentWorkspace[0] = static_cast<size_t>(blockDim) * SLOT_BYTES;
+    currentWorkspace[0] = static_cast<size_t>(MAX_SLOTS) * SLOT_BYTES;
 
     context->SetBlockDim(static_cast<uint32_t>(blockDim));
+
+    // 【真机必需】开启 batchmode，让算子在执行期间独占所需核资源。
+    // 手册 6.2.3.7.2.3 SyncAll 约束：不开 batchmode 时，多流并发 / ≥2 算子并发 /
+    // 并发核数总和超过物理核数 的任一情况都会让核间同步死锁，
+    // 真机表现为 kernel 卡住 3s 超时（aclrtSynchronizeStreamWithTimeout ret=507015）。
+    context->SetScheduleMode(1);
 
     // 根据输入 dtype 选择 tilingKey（half/bf16 -> 0，其余 -> 1）
     uint64_t tilingKey;

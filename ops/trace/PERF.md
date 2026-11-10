@@ -1,11 +1,16 @@
 # Trace 算子性能优化记录
 
 本文记录 Trace 算子在 Ascend 910B1 上的性能分析过程与优化结果。
-所有数字均为**实测**（CAModel 周期级仿真），不是估算。
+数字分两类，**必须区分**：
+
+- **CAModel 周期级仿真**（`tests/bench_910b.sh`）：用来比较指令条数、
+  标量簿记、向量流水停顿。同一 build 内完全可复现。
+- **真机耗时**（`tests/bench_real.sh`，`msprof op`）：唯一能反映 GM 访存、
+  DMA 效率、任务调度开销的口径。**CAModel 不能替代它**，见 §8。
 
 - 目标平台：Ascend 910B1（`dav_2201`），CANN 9.2.0
-- 测量工具：`tests/bench_910b.sh`（CAModel + `profile_aiv_log0.toml`）
-- 参考文档：`docs/CANN_9.0.0_AscendC_算子开发指南.pdf` 第 3.7、3.8 章
+- 测量工具：`tests/bench_910b.sh`（CAModel 周期）、`tests/bench_real.sh`（真机 + 管线归因）
+- 参考文档：`docs/CANN_9.0.0_AscendC_算子开发指南.pdf` 第 2.5.2、3.7、3.8、6.2.3.7 章
 
 ---
 
@@ -52,7 +57,12 @@
 
 ## 3. 优化项
 
-### 3.1 去掉对角掩码（省 ~660 cycles）
+### 3.1 去掉对角掩码（省 ~660 cycles）——**已被 §7.2 取代**
+
+> 本节结论在真机数据出来后**已回退**：靠「填充是元素值重复」来省掉掩码，
+> 等于把正确性押在 `DataCopyPad` 的实现细节上；而真机上真正该做的是把 4B 小块
+> 换成 32B 整块搬运，这时块内就是同一行的真实元素，必须用掩码挑。
+> 见 §7.2。下面保留原始推导，仅作为当时的实测记录。
 
 原实现假设 `DataCopyPad` 在 32B datablock 内的填充字节内容不可依赖，
 于是构造掩码 `[1,0,0,...,0]` 逐块屏蔽。实测发现**填充是「元素值重复」**：
@@ -258,13 +268,105 @@ Host 侧可用的环境变量探针：
 
 ---
 
-## 7. 改动文件
+## 7. 真机数据与 4 倍差距（2026-11-10）
+
+在真实 NPU 上用判题环境跑出来的结果：
+
+| 测试点 | 结果 | 输出误差 | 用时 | 该点最优用时 |
+|---|---|---|---:|---:|
+| 1~6 | Pass | 0.00% | 5.34 ~ 6.20 µs | 1.41 ~ 1.80 µs |
+| 7 | **Runtime Error** | 100% | — | 1.90 µs |
+| 8~12 | Skipped | — | — | 2.52 ~ 3.90 µs |
+
+两个独立问题，必须分开看。
+
+### 7.1 测试点 7 崩溃：`SyncAll` 硬同步死锁（已修）
+
+日志关键行：
+
+```
+[WARN] <ReplayOnce> Kernel run on device 1 No. 1 time failed.
+[ERROR] aclrtSynchronizeStreamWithTimeout(stream, 3000) failed , ret=507015
+Task Duration(us): 0.000000, Block Dim: 16
+```
+
+`ret=507015` 是 3 秒超时，即 kernel 根本没跑完——**卡死**，不是算错。
+对照手册 6.2.3.7.2.3 `SyncAll` 的约束说明：
+
+> 使用该接口进行多核控制时，算子调用时指定的逻辑 numBlocks 必须保证不大于
+> 实际运行该算子的 AI 处理器核数，否则框架进行多轮调度时会插入异常同步，
+> **导致 Kernel"卡死"**。
+>
+> 使用该接口时，建议开启 batchmode 模式，使算子独占全部所需核资源，否则可能
+> 因满足以下条件导致**死锁**：多流并发（≥2 条执行流）、≥2 个算子并发执行、
+> 所有并发算子的核数总和超过物理核数、≥2 个并发算子使用了核间同步功能。
+
+现象完全吻合：**`Block Dim: 1` 的 6 个点全过，唯一 `Block Dim: 16` 的点 7 死锁**。
+单核路径不进 `SyncAll`，所以不受影响；一旦多核就踩约束。
+
+三处修复（缺一不可）：
+
+1. `trace_tiling.cpp`：`context->SetScheduleMode(1)` 开 batchmode，独占核资源。
+2. `trace.h`：参与同步的核数改用运行时 `GetBlockNum()`，不再单纯信 Tiling 下发的
+   `usedCoreNum`——两者一旦不一致，就会出现「部分核等、部分核不到」的经典死锁。
+3. workspace 按 `MAX_SLOTS = 64` 预留（固定 2048B），而不是 `blockDim * 32B`。
+   这样即使框架上核数多于预期，写回也不会越界踩坏别的内存。
+
+### 7.2 5.3~6.2 µs vs 1.41 µs：CAModel 没有建模 DMA
+
+这不是同一口径下的差距，先看清楚差在哪：
+
+- 1.41 µs @1650 MHz ≈ **2327 cycles**。而我们 CAModel 实测「几乎空 kernel」的入口
+  就是 ~3100 cycles，说明**真机任务的基础开销本身就接近 1.4 µs**——最优实现
+  在这个 shape 上几乎没花额外时间。
+- CAModel 对 256×385 报 5040 cycles，其中 MTE2（搬入）只算 **21 cycles**。
+  真机上要按 `diagLen` 个 4 字节跨 1540B 步长去取数（128×129 是 128 个块），
+  每个块都要独立命中一个 32B sector，绝不可能只用 21 cycles。
+
+**结论：CAModel 对 MTE2 的建模严重失真，任何以 GM 访存为主的优化都不能用
+CAModel 判断收益。** §1~§6 的结论只对「指令条数 / 标量簿记 / 向量流水」有效。
+
+针对这一点做了搬运方式改造（`TRACE_COPY` 可切）：
+
+| 方式 | blockLen | 说明 |
+|---|---|---|
+| `TRACE_COPY=0`（默认） | 32B | 从对角元素本身起始整块取满一个 datablock，纯 strided 拷贝，DMA 侧不做「4B 展开成 32B 并复制填充」的工作 |
+| `TRACE_COPY=1` | sizeof(T) | 原来的 4B + `isPad`，块数相同但每块更小 |
+
+两条路径在 UB 里布局完全一致（第 r 个对角元素都在第 r 个 32B block 的起始处），
+所以可以**前半段走 32B、末尾少量行走 4B**——末尾那几行是为了避免 32B 读越过
+输入张量边界。掩码 `[1,0,0,...,0]` 精确挑出块首元素，因此顺带**不再依赖
+`DataCopyPad` 的填充内容**（之前实测 fp32 下填充是「元素值重复」，属实现细节，
+不该依赖），也不用再乘 `1/ELEMS_PER_BLOCK` 还原，数值上更干净。
+
+代价是 CAModel 口径多了掩码构建 + 一次 `Mul`（128×129 从 4538 涨到 5325 cycles，
+约 +17%），但 CAModel 根本不计算这笔 DMA 收益是否为正——**这个 A/B 只能在真机上做**：
+
+```bash
+SHAPES="128x129 256x385" MODES="0 1" bash ops/trace/tests/bench_real.sh
+```
+
+`bench_real.sh` 用 `msprof op --aic-metrics=PipeUtilization` 直接给出
+`aiv_mte2_ratio` / `aiv_vec_ratio` / `aiv_scalar_ratio`，把 4 倍差距归因到具体管线；
+如果 `mte2_ratio` 高，继续往搬运方向做；如果 `scalar_ratio` 高，就得回头砍簿记。
+
+### 7.3 顺带修掉的环境问题
+
+`tests/ut` 的 golden 生成原来 `import torch`，只为用 `torch.trace`。镜像里
+torch 的 pyc 一旦与解释器不匹配（`bad marshal data`），整个 UT 链路直接跑不起来。
+已改为纯 numpy（`np.trace`，同样 FP32 累加），UT 不再依赖 torch。
+
+---
+
+## 8. 改动文件
 
 | 文件 | 改动 |
 |---|---|
-| `op_kernel/trace.h` | UB 合并、去掩码、二分归约、向量化跨核汇总 |
-| `op_kernel/trace_tiling_data.h` | 移除全部性能探针字段 |
-| `op_host/trace_tiling.cpp` | 核数启发式、UB 预算 320→192 B/元素 |
+| `op_kernel/trace.h` | UB 合并、二分归约、向量化跨核汇总；搬运改为 32B 整块 + 掩码；核数取 `GetBlockNum()`；workspace 按 `MAX_SLOTS` 预留 |
+| `op_kernel/trace_tiling_data.h` | 移除性能探针字段，新增 `copyMode`（真机 A/B 用） |
+| `op_host/trace_tiling.cpp` | 核数启发式、UB 预算 320→192 B/元素、`SetScheduleMode(1)` 开 batchmode、workspace 固定上限 |
 | `examples/test_aclnn_trace.cpp` | 支持 `TRACE_DTYPE=half` 及对应回读 |
 | `tests/ut/op_host/test_trace_tiling.cpp` | tiling 期望值同步新策略，补阈值覆盖用例 |
-| `tests/bench_910b.sh` | 新增，取代 `measure_baseline.sh` / `sweep_opts.sh` |
+| `tests/ut/op_kernel/trace_data/gen_data.py` | golden 去掉 torch 依赖，改纯 numpy |
+| `tests/bench_910b.sh` | 新增，取代 `measure_baseline.sh` / `sweep_opts.sh`；支持 `copy=` 切换搬运方式 |
+| `tests/bench_real.sh` | 新增，真机 `msprof op` 测耗时 + 管线归因，支持搬运方式 A/B |

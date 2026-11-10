@@ -95,22 +95,23 @@ i=0
 for c in $CASES; do
     i=$((i + 1))
     co=$(echo "$c" | sed -n 's/.*cores=\([0-9]*\).*/\1/p')
+    cp=$(echo "$c" | sed -n 's/.*copy=\([0-9]*\).*/\1/p')
     mm=$(echo "$c" | sed -n 's/.*m=\([0-9]*\).*/\1/p')
     nn=$(echo "$c" | sed -n 's/.*n=\([0-9]*\).*/\1/p')
     dt=$(echo "$c" | sed -n 's/.*dtype=\([a-z0-9]*\).*/\1/p')
-    co=${co:-0}; mm=${mm:-256}; nn=${nn:-385}; dt=${dt:-float}
-    TAG="c${i}_n${co}_${dt}_${mm}x${nn}"
+    co=${co:-0}; mm=${mm:-256}; nn=${nn:-385}; dt=${dt:-float}; cp=${cp:-0}
+    TAG="c${i}_n${co}_y${cp}_${dt}_${mm}x${nn}"
     LOGD=$OUT/$TAG/log_ca
     mkdir -p "$LOGD"
     ( cd "$CA" && env LD_LIBRARY_PATH="$CA:$VENDOR_LIB:$CANN/lib64" \
         CAMODEL_SOC_VERSION="$SIM_SOC" \
         CAMODEL_LOG_PATH="$LOGD" STARS_LOG_PATH="$LOGD" \
-        TRACE_CORES="$co" TRACE_M="$mm" TRACE_N="$nn" TRACE_DTYPE="$dt" \
+        TRACE_CORES="$co" TRACE_M="$mm" TRACE_N="$nn" TRACE_DTYPE="$dt" TRACE_COPY="$cp" \
         timeout 600 "$APP" ) > "$OUT/$TAG/app.log" 2>&1
     RC=$?
     CHECK=$(grep -oE "\[CHECK\] (PASS|FAIL)" "$OUT/$TAG/app.log" | tail -1)
     [ $RC -eq 0 ] || { tail -15 "$OUT/$TAG/app.log"; die "case $c 运行失败"; }
-    echo "    [$i] $dt ${mm}x${nn} cores=${co:-默认} : ${CHECK:-?}"
+    echo "    [$i] $dt ${mm}x${nn} cores=${co:-默认} copy=${cp} : ${CHECK:-?}"
 done
 ok "全部运行完成"
 
@@ -158,32 +159,33 @@ def span_of(d):
 
 rows = []
 for i, c in enumerate(cases, 1):
-    co = '0'; mm = '256'; nn = '385'; dt = 'float'
+    co = '0'; mm = '256'; nn = '385'; dt = 'float'; cp = '0'
     for part in c.split(','):
-        if part.startswith('cores='): co = part[6:]
+        if part.startswith('copy='): cp = part[5:]
+        elif part.startswith('cores='): co = part[6:]
         elif part.startswith('m='): mm = part[2:]
         elif part.startswith('n='): nn = part[2:]
         elif part.startswith('dtype='): dt = part[6:]
-    d = out / f"c{i}_n{co}_{dt}_{mm}x{nn}"
+    d = out / f"c{i}_n{co}_y{cp}_{dt}_{mm}x{nn}"
     span, dmax = span_of(d / "log_ca")
     log = (d / "app.log")
     txt = log.read_text() if log.exists() else ""
     ok = "[CHECK] PASS" in txt
-    rows.append((i, co, mm, nn, dt, span, dmax, ok))
+    rows.append((i, co, cp, mm, nn, dt, span, dmax, ok))
 
-print(f"    {'#':>2}  {'dtype':>5}  {'shape':>11}  {'cores':>6}  {'kernel跨度':>10}  {'单核最长':>8}  {'正确性':>6}")
-for i, co, mm, nn, dt, span, dmax, ok in rows:
+print(f"    {'#':>2}  {'dtype':>5}  {'shape':>11}  {'cores':>6}  {'copy':>4}  {'kernel跨度':>10}  {'单核最长':>8}  {'正确性':>6}")
+for i, co, cp, mm, nn, dt, span, dmax, ok in rows:
     s = f"{span}" if span is not None else "无数据"
     dm = f"{dmax}" if dmax is not None else "-"
     shown = co if co != '0' else '默认'
-    print(f"    {i:>2}  {dt:>5}  {mm+'x'+nn:>11}  {shown:>6}  {s:>10}  {dm:>8}  {'PASS' if ok else 'FAIL':>6}")
+    print(f"    {i:>2}  {dt:>5}  {mm+'x'+nn:>11}  {shown:>6}  {cp:>4}  {s:>10}  {dm:>8}  {'PASS' if ok else 'FAIL':>6}")
 print()
 
-fails = [r for r in rows if not r[7]]
+fails = [r for r in rows if not r[8]]
 if fails:
     print(f"    !! 有 {len(fails)} 组正确性失败：")
     for r in fails:
-        print(f"       #{r[0]} {r[4]} {r[2]}x{r[3]} cores={r[1]}")
+        print(f"       #{r[0]} {r[5]} {r[3]}x{r[4]} cores={r[1]} copy={r[2]}")
 else:
     print(f"    全部 {len(rows)} 组正确性 PASS")
 PY

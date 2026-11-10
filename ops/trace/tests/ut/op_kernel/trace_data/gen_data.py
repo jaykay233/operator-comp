@@ -6,35 +6,30 @@ import glob
 import numpy as np
 from ml_dtypes import bfloat16
 
-import torch
-
 
 def impl(self):
     """Trace算子golden实现
 
     参数:
-        self: (M, N) numpy 数组或 torch.Tensor，输入二维矩阵
+        self: (M, N) numpy 数组，输入二维矩阵
 
-    返回与输入同为 numpy 或同为 torch 的输出:
+    返回:
         out: (1,) 主对角线元素之和（非方阵取 min(M, N) 个对角元），
              dtype 与 self 一致（内部 FP32 累加）。
-    """
-    return_numpy = not isinstance(self, torch.Tensor)
-    x = torch.as_tensor(self)           # numpy / torch 输入统一转 torch
-    orig_dtype = x.dtype
 
-    # 统一转 float32 累加（fp16 精度不足，内部用 FP32）
-    x32 = x.float()
+    说明：这里刻意只用 numpy，不引入 torch。golden 只需要「取对角 + 求和」，
+    torch.trace 与 numpy 结果一致，但 torch 会把 UT 数据生成链路绑到一个
+    很重的可选依赖上（镜像里一旦 pyc/版本不匹配，整个 UT 直接跑不起来）。
+    """
+    # 统一转 float32 累加（fp16 精度不足，内部用 FP32），与 kernel 侧一致
+    orig_dtype = self.dtype
+    x32 = np.asarray(self, dtype=np.float32)
 
     # 主对角线取数 + 求和（非方阵取 min(M, N) 个对角元），输出 shape (1,)
-    out = torch.trace(x32).reshape(1)
+    out = np.trace(x32).reshape(1)
 
     # 转回原始 dtype（与 JSON output_desc 一致）
-    out = out.to(orig_dtype)
-
-    if return_numpy:
-        return out.numpy()
-    return out
+    return out.astype(orig_dtype)
 
 
 if __name__ == "__main__":
